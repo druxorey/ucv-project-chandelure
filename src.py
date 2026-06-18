@@ -1,172 +1,620 @@
 from os import getenv
+from datetime import datetime
 from dotenv import load_dotenv
 from mssql_python import connect
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.pdfgen import canvas
 
-def tipo_restriccion(tipo):
-    if tipo == "PRIMARY_KEY_CONSTRAINT":
-        return "Clave Primaria"
-    elif tipo == "FOREIGN_KEY_CONSTRAINT":
-        return "Clave Foránea"
-    elif tipo == "UNIQUE_CONSTRAINT":
-        return "Restricción de Unicidad"
-    elif tipo == "CHECK_CONSTRAINT":
-        return "Restricción de Comprobación"
-    else:
-        return "Otro Tipo de Restricción"
-    
-one_tab = ParagraphStyle(
-    'OneTab',
-    parent=getSampleStyleSheet()['Normal'],
-    leftIndent=20,      # Shoves the entire paragraph right by 20 points
-)
+class NumberedCanvas(canvas.Canvas):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.savedPageStates = []
 
-two_tab = ParagraphStyle(
-    'TwoTab',
-    parent=getSampleStyleSheet()['Normal'],
-    leftIndent=40,      # Shoves the entire paragraph right by 40 points
-)
+    def showPage(self):
+        self.savedPageStates.append(dict(self.__dict__))
+        self._startPage()
 
-# Confirguracion de los parametros de conexion a la base de datos
-load_dotenv()  # Carga las variables de entorno desde el archivo .env
-SQL_CONNECTION_STRING = getenv("SQL_CONNECTION_STRING")
+    def save(self):
+        numPages = len(self.savedPageStates)
+        for state in self.savedPageStates:
+            self.__dict__.update(state)
+            self.drawPageDecorations(numPages)
+            super().showPage()
+        super().save()
 
-try:
-    # Establece la conexión
-    connection = connect(SQL_CONNECTION_STRING)
-    cursor = connection.cursor()
+    def drawPageDecorations(self, pageCount):
+        self.saveState()
+        if self._pageNumber > 1:
+            self.setStrokeColor(colors.HexColor("#E2E8F0"))
+            self.setLineWidth(0.75)
+            self.line(54, 738, 558, 738)
+            self.setFont("Helvetica-Bold", 8)
+            self.setFillColor(colors.HexColor("#1A365D"))
+            self.drawString(54, 744, "StreamUCV — REPORTE TÉCNICO DE LA BASE DE DATOS")
+            self.setFont("Helvetica", 8)
+            self.setFillColor(colors.HexColor("#718096"))
+            self.line(54, 54, 558, 54)
+            pageText = f"Página {self._pageNumber} de {pageCount}"
+            self.drawRightString(558, 42, pageText)
+        self.restoreState()
 
-    # Obtiene el nombre de la base de datos y esquema
-    cursor.execute(
-        "SELECT " \
-            "DB_NAME() AS DatabaseName"
+
+def getRestrictionType(restrictionTypeString):
+    mapping = {
+        "PRIMARY_KEY_CONSTRAINT": "Clave Primaria",
+        "FOREIGN_KEY_CONSTRAINT": "Clave Foránea",
+        "UNIQUE_CONSTRAINT": "Restricción de Unicidad",
+        "CHECK_CONSTRAINT": "Restricción de Comprobación"
+    }
+    return mapping.get(restrictionTypeString, "Otro Tipo de Restricción")
+
+
+def getTriggerType(triggerTypeString):
+    mapping = {
+        "SQL_TRIGGER": "Disparador T-SQL",
+        "CLR_TRIGGER": "Disparador CLR"
+    }
+    return mapping.get(triggerTypeString, "Otro")
+
+
+def getDictionaryData():
+    load_dotenv()
+    sqlConnectionString = getenv("SQL_CONNECTION_STRING")
+
+    if not sqlConnectionString:
+        raise ValueError("The SQL_CONNECTION_STRING variable is not defined in the .env file")
+
+    data = {}
+    connection = None
+    cursor = None
+
+    try:
+        connection = connect(sqlConnectionString)
+        cursor = connection.cursor()
+
+        cursor.execute("SELECT DB_NAME() AS DatabaseName")
+        data["dbName"] = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) AS Cantidad_Tablas FROM sys.tables WHERE SCHEMA_NAME(schema_id) = 'streaming'")
+        data["totalTables"] = cursor.fetchone()[0]
+
+        cursor.execute("""
+            SELECT 
+                t.name AS Nombre_Tabla, 
+                COUNT(i.name) AS Cantidad_Indices 
+            FROM sys.tables t 
+            LEFT JOIN sys.indexes i ON t.object_id = i.object_id 
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            GROUP BY t.name
+        """)
+        data["indexSummary"] = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT 
+                t.name AS Nombre_Tabla, 
+                CASE WHEN i.name IS NULL THEN 'HEAP' ELSE i.name END AS Nombre_Indice 
+            FROM sys.tables t 
+            JOIN sys.indexes i ON t.object_id = i.object_id
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+        """)
+        data["tableIndexesList"] = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT 
+                t.name AS Nombre_Tabla, 
+                i.name AS Nombre_Indice, 
+                i.type_desc AS Tipo_Indice, 
+                STRING_AGG(c.name, ', ') AS Columnas, 
+                i.is_unique AS Es_Unico 
+            FROM sys.tables t 
+            JOIN sys.indexes i ON t.object_id = i.object_id 
+            JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id 
+            JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id 
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            GROUP BY t.name, i.name, i.type_desc, i.is_unique
+        """)
+        data["indexDetails"] = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT 
+                o.name AS Nombre_Restriccion, 
+                t.name AS Tabla_Asociada, 
+                o.type_desc AS Tipo_Restriccion 
+            FROM sys.objects o 
+            JOIN sys.tables t ON o.parent_object_id = t.object_id
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+        """)
+        data["constraints"] = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT 
+                tr.name AS Nombre_Trigger, 
+                t.name AS Tabla_Asociada, 
+                CASE WHEN tr.is_disabled = 1 THEN 'INACTIVO' ELSE 'ACTIVO' END AS Estado, 
+                tr.create_date AS Fecha_Creacion, 
+                tr.modify_date AS Fecha_Modificacion,
+                tr.type_desc AS Tipo_Trigger
+            FROM sys.triggers tr 
+            LEFT JOIN sys.tables t ON tr.parent_id = t.object_id
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+        """)
+        data["triggers"] = cursor.fetchall()
+
+        cursor.execute("""
+            WITH SumaColumnas AS (
+                SELECT object_id, SUM(max_length) AS Tamano_Registro_Bytes
+                FROM sys.columns
+                GROUP BY object_id
+            ),
+            ConteoRegistros AS (
+                SELECT object_id, [rows] AS Numero_Registros
+                FROM sys.partitions
+                WHERE index_id <= 1
+            )
+            SELECT t.name AS Tabla,
+            (sc.Tamano_Registro_Bytes * cr.Numero_Registros) AS Tamano_Tabla_Bytes,
+            CAST((sc.Tamano_Registro_Bytes * cr.Numero_Registros) / 1024.0 AS DECIMAL(10,2)) AS Tamano_Tabla_KB
+            FROM sys.tables t
+            JOIN SumaColumnas sc ON t.object_id = sc.object_id
+            JOIN ConteoRegistros cr ON t.object_id = cr.object_id
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+        """)
+        data["tableSizes"] = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT 
+                t.name AS Tabla, 
+                SUM(c.max_length) AS Tamano_Registro_Bytes 
+            FROM sys.tables t 
+            JOIN sys.columns c ON t.object_id = c.object_id 
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            GROUP BY t.name;
+        """)
+        data["recordSizes"] = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT 
+                t.name AS Tabla, 
+                c.name AS Columna, 
+                ty.name AS Tipo_Dato, 
+                c.max_length AS Tamano_Bytes 
+            FROM sys.columns c 
+            JOIN sys.tables t ON c.object_id = t.object_id 
+            JOIN sys.types ty ON c.user_type_id=ty.user_type_id
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+        """)
+        data["columnSizes"] = cursor.fetchall()
+
+        cursor.execute("""
+            WITH SumaColumnas AS (
+                SELECT object_id, SUM(max_length) AS Tamano_Registro_Bytes
+                FROM sys.columns
+                GROUP BY object_id
+            ),
+            ColumnaClave AS (
+                SELECT
+                i.object_id,
+                SUM(c.max_length) AS Tamano_Clave_Bytes
+                FROM sys.indexes i
+                JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                WHERE i.is_primary_key = 1
+                GROUP BY i.object_id
+            )
+            SELECT
+            t.name AS Tabla,
+            (8192/sc.Tamano_Registro_Bytes) AS Factor_Bloqueo_Tabla,
+            (8192/(8+ COALESCE(cc.Tamano_Clave_Bytes, 4))) AS Factor_Bloqueo_Indice
+            FROM sys.tables t
+            JOIN SumaColumnas sc ON t.object_id = sc.object_id
+            LEFT JOIN ColumnaClave cc ON t.object_id = cc.object_id
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+        """)
+        data["blockingFactors"] = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT 
+                t.name AS Tabla, 
+                SUM(p.rows) AS Cantidad_Registros 
+            FROM sys.tables t 
+            JOIN sys.partitions p ON t.object_id = p.object_id 
+            WHERE p.index_id <= 1 AND SCHEMA_NAME(t.schema_id) = 'streaming'
+            GROUP BY t.name;
+        """)
+        data["rowCounts"] = cursor.fetchall()
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+    return data
+
+
+def createBulletPoint(bulletTitle, bulletBody, styleCell, styleCellBold):
+    return Table(
+        [[Paragraph("&bull;", styleCellBold), Paragraph(f"<b>{bulletTitle}:</b> {bulletBody}", styleCell)]],
+        colWidths=[15, 489],
+        style=TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING', (0,0), (-1,-1), 2),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+        ])
     )
-    rows = cursor.fetchall()
-    
-    # Crea un documento PDF y array de elementos para el informe
-    pdf = SimpleDocTemplate("report.pdf")
+
+
+def generatePdfReport(data, outputFilename="report.pdf"):
+    doc = SimpleDocTemplate(
+        outputFilename,
+        pagesize=letter,
+        leftMargin=54,
+        rightMargin=54,
+        topMargin=72,
+        bottomMargin=72
+    )
+
+    styles = getSampleStyleSheet()
+
+    styleTitle = ParagraphStyle(
+        'DocTitle',
+        parent=styles['Heading1'],
+        fontName='Helvetica-Bold',
+        fontSize=20,
+        leading=24,
+        textColor=colors.HexColor('#1A365D'),
+        spaceAfter=15
+    )
+
+    styleH2 = ParagraphStyle(
+        'SectionHeader',
+        parent=styles['Heading2'],
+        fontName='Helvetica-Bold',
+        fontSize=13,
+        leading=16,
+        textColor=colors.HexColor('#2B6CB0'),
+        spaceBefore=14,
+        spaceAfter=8,
+        keepWithNext=True
+    )
+
+    styleBody = ParagraphStyle(
+        'BodyTextCustom',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor('#2D3748'),
+        spaceAfter=10
+    )
+
+    styleCell = ParagraphStyle(
+        'CellText',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor('#2D3748')
+    )
+
+    styleCellBold = ParagraphStyle(
+        'CellTextBold',
+        parent=styleCell,
+        fontName='Helvetica-Bold'
+    )
+
+    styleHeaderCell = ParagraphStyle(
+        'HeaderCell',
+        parent=styleCell,
+        fontName='Helvetica-Bold',
+        textColor=colors.white
+    )
+
     flowables = []
+    flowables.append(Paragraph(f"Reporte Técnico de la Base de Datos «{data['dbName']}»", styleTitle))
 
-    # Escribe el título del informe
-    text = f"Reporte técnico de la base de datos {rows[0][0]}"
-    flowables.append(Paragraph(text, getSampleStyleSheet()['Heading1']))
+    metadataData = [
+        [Paragraph("Base de Datos Analizada:", styleCellBold), Paragraph(data['dbName'], styleCell)],
+        [Paragraph("Esquema de Trabajo:", styleCellBold), Paragraph("«streaming»", styleCell)],
+        [Paragraph("Fecha del Diagnóstico:", styleCellBold), Paragraph(datetime.now().strftime("%d/%m/%Y — %H:%M"), styleCell)],
+        [Paragraph("Total de Tablas Detectadas:", styleCellBold), Paragraph(str(data['totalTables']), styleCell)]
+    ]
+    metadataTable = Table(metadataData, colWidths=[150, 354])
+    metadataTable.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F8FAFC')),
+        ('BOX', (0,0), (-1,-1), 1, colors.HexColor('#E2E8F0')),
+        ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
+        ('PADDING', (0,0), (-1,-1), 6),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    flowables.append(metadataTable)
 
-    text = f"Al analizar la base de datos {rows[0][0]}, se encontraron los siguientes aspectos relevantes relacionados a su estructura y organización."
-    flowables.append(Paragraph(text, getSampleStyleSheet()['Normal']))
+    sec1Flowables = []
+    sec1Flowables.append(Paragraph("1. Tablas e Índices del Sistema", styleH2))
 
-    text = f"1. Tablas e índices."
-    flowables.append(Paragraph(text, getSampleStyleSheet()['Heading2']))
-
-    # Cantidad total de tablas
-    cursor.execute(
-        "SELECT COUNT(*) AS Cantidad_Tablas " \
-        "FROM sys.tables"
+    totalIndexes = sum(row[1] for row in data["indexSummary"])
+    sec1Intro = (
+        f"La base de datos analizada contiene una <b>cantidad total de {data['totalTables']} tablas</b> estructuradas "
+        f"dentro del esquema de trabajo «streaming». Se ha detectado una <b>cantidad total de {totalIndexes} índices</b> "
+        f"configurados a lo largo de estas tablas. A continuación, se detalla la cantidad de índices "
+        f"definidos individualmente para cada una de las tablas, junto con su composición física."
     )
-    rows = cursor.fetchall()
+    sec1Flowables.append(Paragraph(sec1Intro, styleBody))
 
-    text = f"La base de datos cuenta con {rows[0][0]} tablas de usuario definidas dentro del esquema."
-    flowables.append(Paragraph(text, getSampleStyleSheet()['Normal']))
-    flowables.append(Spacer(1, 5))
+    indicesHeaders = ["Tabla", "Índice", "Tipo de Índice", "Columnas Asociadas", "Es Único"]
+    indicesRows = [ [Paragraph(h, styleHeaderCell) for h in indicesHeaders] ]
 
-    # Nombre de las tablas y cantidad de índices existentes en la base de datos
-    cursor.execute(
-        "SELECT " \
-            "t.name AS Nombre_Tabla, " \
-            "COUNT(i.name) AS Cantidad_Indices " \
-        "FROM sys.tables t " \
-        "LEFT JOIN sys.indexes i ON t.object_id = i.object_id " \
-        "GROUP BY t.name"
-    )
-    rows = cursor.fetchall()
+    for tableRes in data["indexSummary"]:
+        tableName, _ = tableRes
+        indexesOfTable = [idx for idx in data["indexDetails"] if idx[0] == tableName]
 
-    # Columnas, unicidad e información relevante disponible en el Diccionario de Datos relacionada a cada índice creado en el esquema.
-    cursor.execute(
-        "SELECT " \
-            "t.name AS Nombre_Tabla, " \
-            "i.name AS Nombre_Indice, " \
-            "i.type_desc AS Tipo_Indice, " \
-            "STRING_AGG(c.name, ', ') AS Columnas, " \
-            "i.is_unique AS Es_Unico " \
-        "FROM sys.tables t " \
-        "JOIN sys.indexes i ON t.object_id = i.object_id " \
-        "JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id " \
-        "JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id " \
-        "GROUP BY t.name, i.name, i.type_desc, i.is_unique "
-    )
-    rows2 = cursor.fetchall()
-
-    for row in rows:
-        text = f"- {row[0]} con {row[1]} {'índices' if row[1] != 1 else 'índice'}{':' if row[1] > 0 else ''}"
-        flowables.append(Paragraph(text, one_tab))
-        for row2 in rows2:
-            if row2[0] == row[0]:
-                text = f"- {row2[1]}: Índice {'agrupado' if row2[2] == 'CLUSTERED' else 'no agrupado'}, {'único' if row2[3] else 'no Único'}, asociado a {row2[3]}"
-                flowables.append(Paragraph(text, two_tab))
-        flowables.append(Spacer(1, 5))
-
-    text = f"2. Restricciones."
-    flowables.append(Paragraph(text, getSampleStyleSheet()['Heading2']))
-    
-    # Nombre, tabla asociada y tipo de las restricciones existentes en el esquema
-    cursor.execute(
-        "SELECT " \
-            "t.name AS Tabla_Asociada, " \
-            "o.name AS Nombre_Restriccion, " \
-            "o.type_desc AS Tipo_Restriccion " \
-        "FROM sys.objects o " \
-        "JOIN sys.tables t ON o.parent_object_id = t.object_id;"
-    )
-    rows = cursor.fetchall()
-
-    text = f"En cuanto a las restricciones existentes en el esquema, se encontraron {len(rows)} restricciones incluyendo claves primarias, claves foráneas, restricciones de unicidad y restricciones de comprobación."
-    flowables.append(Paragraph(text, getSampleStyleSheet()['Normal']))
-    flowables.append(Spacer(1, 5))
-
-    table_name = ""
-    for row in rows:
-        if row[0] != table_name:
-            table_name = row[0]
-            text = f"- Tabla {row[0]}: {'Sin restricciones' if row[1] is None else ''}"
-            flowables.append(Paragraph(text, one_tab))
-            if row[1]:
-                    text = f"- {row[1]}: {tipo_restriccion(row[2])}"
-                    flowables.append(Paragraph(text, two_tab))
-            flowables.append(Spacer(1, 5)) 
+        if not indexesOfTable:
+            indicesRows.append([
+                Paragraph(tableName, styleCellBold),
+                Paragraph("«HEAP»", styleCell),
+                Paragraph("Sin índices (Heap)", styleCell),
+                Paragraph("—", styleCell),
+                Paragraph("No", styleCell)
+            ])
         else:
-            text = f"- {row[1]}: {tipo_restriccion(row[2])}"
-            flowables.append(Paragraph(text, two_tab))
-            flowables.append(Spacer(1, 5))
+            for idx in indexesOfTable:
+                _, idxName, idxType, cols, isUnique = idx
+                indicesRows.append([
+                    Paragraph(tableName, styleCellBold),
+                    Paragraph(idxName, styleCell),
+                    Paragraph("Agrupado" if idxType == "CLUSTERED" else "No agrupado", styleCell),
+                    Paragraph(cols, styleCell),
+                    Paragraph("Sí" if isUnique else "No", styleCell)
+                ])
 
-    text = f"3. Triggers."
-    flowables.append(Paragraph(text, getSampleStyleSheet()['Heading2']))
+    tableIndices = Table(indicesRows, colWidths=[84, 130, 90, 150, 50])
+    tableIndices.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 6),
+        ('TOPPADDING', (0,0), (-1,0), 6),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F8FAFC')]),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('PADDING', (0,0), (-1,-1), 5),
+    ]))
+    sec1Flowables.append(tableIndices)
+    flowables.append(KeepTogether(sec1Flowables))
 
-    # Nombre, tipo, estado y tabla activadora de cada trigger existente en el esquema.
-    cursor.execute(
-        "SELECT " \
-            "tr.name AS Nombre_Trigger, " \
-            "t.name AS Tabla_Asociada, " \
-            "CASE WHEN tr.is_disabled = 1 THEN 'INACTIVO' ELSE 'ACTIVO' END AS Estado, " \
-            "tr.create_date AS Fecha_Creacion, " \
-            "tr.modify_date AS Fecha_Modificacion " \
-        "FROM sys.triggers tr " \
-        "LEFT JOIN sys.tables t ON tr.parent_id = t.object_id;"
+    sec2Flowables = []
+    sec2Flowables.append(Paragraph("2. Restricciones del Esquema de Datos", styleH2))
+
+    sec2Intro = (
+        f"Se detectó una <b>cantidad total de {len(data['constraints'])} restricciones</b> de integridad física "
+        f"aplicadas en el esquema de la base de datos. Estas reglas garantizan que las relaciones lógicas y límites "
+        f"de valores se mantengan estables durante las transacciones en el motor."
     )
-    rows = cursor.fetchall()
+    sec2Flowables.append(Paragraph(sec2Intro, styleBody))
 
-    text = f"Se encontraron {len(rows)} triggers en el esquema."
-    flowables.append(Paragraph(text, getSampleStyleSheet()['Normal']))
+    restrHeaders = ["Tabla Asociada", "Nombre de la Restricción", "Tipo de Restricción"]
+    restrRows = [ [Paragraph(h, styleHeaderCell) for h in restrHeaders] ]
 
-    for row in rows:
-        text = f"- {row[0]} asociado a {row[1]}, actualmente {row[2].lower()} creado el {row[3]} y modificado por última vez el {row[4]}"
-        flowables.append(Paragraph(text, one_tab))
+    for row in data["constraints"]:
+        restName, associatedTable, restType = row
+        restrRows.append([
+            Paragraph(associatedTable, styleCellBold),
+            Paragraph(restName, styleCell),
+            Paragraph(getRestrictionType(restType), styleCell)
+        ])
 
-    # Construye el pdf con la información obtenida
-    pdf.build(flowables)
+    tableRestr = Table(restrRows, colWidths=[152, 200, 152])
+    tableRestr.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F8FAFC')]),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('PADDING', (0,0), (-1,-1), 5),
+    ]))
+    sec2Flowables.append(tableRestr)
+    flowables.append(KeepTogether(sec2Flowables))
+    flowables.append(Spacer(1, 20))
 
-    # Cierra la conexión
-    cursor.close()
-    connection.close()
+    sec3Flowables = []
+    sec3Flowables.append(Paragraph("3. Disparadores (Triggers) Registrados", styleH2))
 
-except Exception as e:
-    print(f"Error al conectar a la base de datos: {e}")
+    sec3Intro = (
+        f"El esquema cuenta actualmente con una <b>cantidad de {len(data['triggers'])} disparadores</b> (triggers) "
+        f"de usuario definidos. A continuación se detalla el estado operativo, tipo y última fecha de modificación "
+        f"de cada uno de estos procesos automatizados."
+    )
+    sec3Flowables.append(Paragraph(sec3Intro, styleBody))
+
+    if not data["triggers"]:
+        sec3Flowables.append(Paragraph("<i>No se encontraron disparadores (triggers) definidos en el repositorio de datos actual.</i>", styleBody))
+    else:
+        trigHeaders = ["Nombre del Trigger", "Tabla Asociada", "Tipo", "Estado", "Fecha de Modificación"]
+        trigRows = [ [Paragraph(h, styleHeaderCell) for h in trigHeaders] ]
+
+        for row in data["triggers"]:
+            trigName, tabName, status, _, modDate, triggerType = row
+            dateStr = modDate.strftime("%Y-%m-%d %H:%M") if isinstance(modDate, datetime) else str(modDate)
+            trigRows.append([
+                Paragraph(trigName, styleCellBold),
+                Paragraph(tabName, styleCell),
+                Paragraph(getTriggerType(triggerType), styleCell),
+                Paragraph(status, styleCell),
+                Paragraph(dateStr, styleCell)
+            ])
+
+        tableTrig = Table(trigRows, colWidths=[124, 100, 100, 70, 110])
+        tableTrig.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F8FAFC')]),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('PADDING', (0,0), (-1,-1), 5),
+        ]))
+        sec3Flowables.append(tableTrig)
+
+    flowables.append(KeepTogether(sec3Flowables))
+    flowables.append(Spacer(1, 20))
+
+    sec4Flowables = []
+    sec4Flowables.append(Paragraph("4. Estructura Física y Dimensiones del Esquema", styleH2))
+    sec4Flowables.append(Paragraph("A continuación se muestra el desglose del tamaño real asignado a cada columna detectada en la base de datos de acuerdo a su tipo de datos. Los campos extensibles de tamaño variable que registran un tamaño máximo interno en el motor de base de datos se normalizan a efectos prácticos con un valor de visualización nominal.", styleBody))
+
+    colHeaders = ["Tabla", "Columna", "Tipo de Dato", "Tamaño (Bytes)"]
+    colRows = [ [Paragraph(h, styleHeaderCell) for h in colHeaders] ]
+    for row in data["columnSizes"]:
+        tName, colName, typeName, maxLength = row
+        sizeStr = "MAX (8000)" if maxLength == -1 else str(maxLength)
+        colRows.append([
+            Paragraph(tName, styleCellBold),
+            Paragraph(colName, styleCell),
+            Paragraph(typeName, styleCell),
+            Paragraph(sizeStr, styleCell)
+        ])
+
+    tableCols = Table(colRows, colWidths=[154, 150, 120, 80])
+    tableCols.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F8FAFC')]),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('PADDING', (0,0), (-1,-1), 4),
+    ]))
+    sec4Flowables.append(tableCols)
+    flowables.append(KeepTogether(sec4Flowables))
+    flowables.append(Spacer(1, 20))
+
+    sec5Flowables = []
+    sec5Flowables.append(Paragraph("5. Capacidad de Almacenamiento y Factor de Bloqueo", styleH2))
+
+    explanationBlock = (
+        "Se evalúan las capacidades de almacenamiento físico considerando un tamaño de bloque o página de datos "
+        "estándar de 8 KB (8192 Bytes). El factor de bloqueo representa la cantidad de registros fijos e indexables "
+        "que pueden ser almacenados de forma consecutiva dentro de una única página lógica de datos. Las fórmulas "
+        "aplicadas corresponden a los siguientes criterios de optimización teórica:"
+    )
+    sec5Flowables.append(Paragraph(explanationBlock, styleBody))
+
+    storageHeaders = ["Tabla", "Tamaño Tabla (Bytes)", "Tamaño Tabla (KB)", "Reg. Size (Bytes)", "Fbt", "Fbi"]
+    storageRows = [ [Paragraph(h, styleHeaderCell) for h in storageHeaders] ]
+
+    blockingFactorsMap = {b[0]: (b[1], b[2]) for b in data["blockingFactors"]}
+    recordSizesMap = {r[0]: r[1] for r in data["recordSizes"]}
+
+    for row in data["tableSizes"]:
+        tName, sizeBytes, sizeKb = row
+        recordSize = recordSizesMap.get(tName, 1)
+        fbt, fbi = blockingFactorsMap.get(tName, (1, 682))
+
+        storageRows.append([
+            Paragraph(tName, styleCellBold),
+            Paragraph(str(sizeBytes), styleCell),
+            Paragraph(str(sizeKb) + " KB", styleCell),
+            Paragraph(str(recordSize), styleCell),
+            Paragraph(str(fbt), styleCell),
+            Paragraph(str(fbi), styleCell)
+        ])
+
+    tableStorage = Table(storageRows, colWidths=[114, 100, 100, 70, 60, 60])
+    tableStorage.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F8FAFC')]),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('PADDING', (0,0), (-1,-1), 5),
+    ]))
+    sec5Flowables.append(tableStorage)
+    flowables.append(KeepTogether(sec5Flowables))
+    flowables.append(Spacer(1, 20))
+
+    sec6Flowables = []
+    sec6Flowables.append(Paragraph("6. Modelado de Accesos a Disco y Costos de Tiempo", styleH2))
+
+    costExplanation = (
+        "De acuerdo con los requerimientos técnicos fijados por la dirección tecnológica, se modelan los accesos "
+        "a disco físicos (lectura de páginas) estimando una velocidad de transferencia teórica estándar de 17 MB/s. "
+        "Se evalúan y contrastan dos escenarios lógicos para consultas de igualdad sobre un campo clave:"
+    )
+    sec6Flowables.append(Paragraph(costExplanation, styleBody))
+
+    sec6Flowables.append(createBulletPoint(
+        "Búsqueda Secuencial (Table Scan)",
+        "Se deben leer e inspeccionar la totalidad de las páginas de datos en el archivo físico de la tabla. El costo total en accesos equivale a la totalidad de las páginas asignadas.",
+        styleCell,
+        styleCellBold
+    ))
+    sec6Flowables.append(Spacer(1, 4))
+    sec6Flowables.append(createBulletPoint(
+        "Búsqueda Indexada (Index Access)",
+        "Si existe un índice, se asume un acceso constante por niveles a través de la altura del árbol B+ más la lectura del registro final de datos en la página de datos. Costo constante de 3 páginas físicas de E/S.",
+        styleCell,
+        styleCellBold
+    ))
+    sec6Flowables.append(Spacer(1, 10))
+
+    costHeaders = ["Tabla", "E/S Table Scan", "Tiempo Scan", "E/S Indexada", "Tiempo Indexado"]
+    costRows = [ [Paragraph(h, styleHeaderCell) for h in costHeaders] ]
+
+    indexCountsMap = {r[0]: r[1] for r in data["indexSummary"]}
+    rowCountsMap = {r[0]: r[1] for r in data["rowCounts"]}
+
+    for row in data["tableSizes"]:
+        tName, _, _ = row
+        recordSize = recordSizesMap.get(tName, 1)
+        rowNum = rowCountsMap.get(tName, 0)
+        hasIndex = indexCountsMap.get(tName, 0) > 0
+
+        fbt, _ = blockingFactorsMap.get(tName, (max(1, 8192 // recordSize), 682))
+        totalPages = max(1, -(-rowNum // fbt))
+
+        scanAccesses = totalPages
+        scanTimeMs = (scanAccesses * 8192) / (17 * 1024 * 1024) * 1000
+
+        if hasIndex:
+            idxAccesses = 3
+            idxTimeMs = (idxAccesses * 8192) / (17 * 1024 * 1024) * 1000
+        else:
+            idxAccesses = scanAccesses
+            idxTimeMs = scanTimeMs
+
+        scanTimeStr = f"{scanTimeMs:.4f} ms" if scanTimeMs >= 0.0001 else "< 0.0001 ms"
+        idxTimeStr = f"{idxTimeMs:.4f} ms" if idxTimeMs >= 0.0001 else "< 0.0001 ms"
+        idxAccessStr = str(idxAccesses) if hasIndex else f"{idxAccesses} (Sin Índice)"
+
+        costRows.append([
+            Paragraph(tName, styleCellBold),
+            Paragraph(str(scanAccesses), styleCell),
+            Paragraph(scanTimeStr, styleCell),
+            Paragraph(idxAccessStr, styleCell),
+            Paragraph(idxTimeStr, styleCell)
+        ])
+
+    tableCosts = Table(costRows, colWidths=[104, 100, 100, 100, 100])
+    tableCosts.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F8FAFC')]),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('PADDING', (0,0), (-1,-1), 5),
+    ]))
+    sec6Flowables.append(tableCosts)
+    flowables.append(KeepTogether(sec6Flowables))
+
+    doc.build(flowables, canvasmaker=NumberedCanvas)
+
+
+if __name__ == "__main__":
+    print("Initiating connection to the SQL Server Data Dictionary...")
+    try:
+        databaseData = getDictionaryData()
+        print(f"Successfully connected to the database «{databaseData['dbName']}».")
+        print("Generating optimized PDF report...")
+        generatePdfReport(databaseData)
+        print("\033[1;32m[SUCCESS]\033[0m The technical report 'report.pdf' has been successfully generated.")
+    except Exception as e:
+        print("\n\033[1;31m[CRITICAL ERROR]\033[0m Initialization failed:")
+        print(f"Detail: {e}")
