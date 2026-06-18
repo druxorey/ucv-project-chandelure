@@ -1,13 +1,23 @@
-from os import getenv
+from os import getenv, name as osName
 from datetime import datetime
 from dotenv import load_dotenv
 from mssql_python import connect
+import subprocess, time
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
 from reportlab.pdfgen import canvas
+
+ansiBlue = "\033[1;34m"
+ansiCyan = "\033[1;36m"
+ansiGreen = "\033[1;32m"
+ansiYellow = "\033[1;33m"
+ansiRed = "\033[1;31m"
+ansiMagenta = "\033[1;35m"
+ansiReset = "\033[0m"
+ansiBold = "\033[1m"
 
 class NumberedCanvas(canvas.Canvas):
     def __init__(self, *args, **kwargs):
@@ -41,6 +51,10 @@ class NumberedCanvas(canvas.Canvas):
             pageText = f"Página {self._pageNumber} de {pageCount}"
             self.drawRightString(558, 42, pageText)
         self.restoreState()
+
+
+def clearScreen():
+    subprocess.run(["clear"] if osName != "nt" else ["cls"], shell=True if osName == "nt" else False)
 
 
 def getRestrictionType(restrictionTypeString):
@@ -317,11 +331,11 @@ def generatePdfReport(data, outputFilename="report.pdf"):
     )
 
     flowables = []
-    flowables.append(Paragraph(f"Reporte Técnico de la Base de Datos «{data['dbName']}»", styleTitle))
+    flowables.append(Paragraph(f"Reporte Técnico de la Base de Datos '{data['dbName']}'", styleTitle))
 
     metadataData = [
         [Paragraph("Base de Datos Analizada:", styleCellBold), Paragraph(data['dbName'], styleCell)],
-        [Paragraph("Esquema de Trabajo:", styleCellBold), Paragraph("«streaming»", styleCell)],
+        [Paragraph("Esquema de Trabajo:", styleCellBold), Paragraph("'streaming'", styleCell)],
         [Paragraph("Fecha del Diagnóstico:", styleCellBold), Paragraph(datetime.now().strftime("%d/%m/%Y — %H:%M"), styleCell)],
         [Paragraph("Total de Tablas Detectadas:", styleCellBold), Paragraph(str(data['totalTables']), styleCell)]
     ]
@@ -341,7 +355,7 @@ def generatePdfReport(data, outputFilename="report.pdf"):
     totalIndexes = sum(row[1] for row in data["indexSummary"])
     sec1Intro = (
         f"La base de datos analizada contiene una <b>cantidad total de {data['totalTables']} tablas</b> estructuradas "
-        f"dentro del esquema de trabajo «streaming». Se ha detectado una <b>cantidad total de {totalIndexes} índices</b> "
+        f"dentro del esquema de trabajo 'streaming'. Se ha detectado una <b>cantidad total de {totalIndexes} índices</b> "
         f"configurados a lo largo de estas tablas. A continuación, se detalla la cantidad de índices "
         f"definidos individualmente para cada una de las tablas, junto con su composición física."
     )
@@ -357,7 +371,7 @@ def generatePdfReport(data, outputFilename="report.pdf"):
         if not indexesOfTable:
             indicesRows.append([
                 Paragraph(tableName, styleCellBold),
-                Paragraph("«HEAP»", styleCell),
+                Paragraph("'HEAP'", styleCell),
                 Paragraph("Sin índices (Heap)", styleCell),
                 Paragraph("—", styleCell),
                 Paragraph("No", styleCell)
@@ -607,14 +621,112 @@ def generatePdfReport(data, outputFilename="report.pdf"):
     doc.build(flowables, canvasmaker=NumberedCanvas)
 
 
+def runCostSimulationMenu(data):
+    clearScreen()
+    print(f"\n{ansiBlue}╒════════════════════════════════════════════════════════╕{ansiReset}")
+    print(f"{ansiBlue}│            {ansiReset}SIMULACIÓN INTERACTIVA DE COSTOS{ansiBlue}            │{ansiReset}")
+    print(f"{ansiBlue}╘════════════════════════════════════════════════════════╛{ansiReset}\n")
+    print("Tablas disponibles en el esquema 'streaming':")
+
+    rowCountsMap = {r[0]: r[1] for r in data["rowCounts"]}
+    blockingFactorsMap = {b[0]: (b[1], b[2]) for b in data["blockingFactors"]}
+    recordSizesMap = {r[0]: r[1] for r in data["recordSizes"]}
+
+    tableList = sorted(list(recordSizesMap.keys()))
+    for i, tName in enumerate(tableList, start=1):
+        print(f"  {ansiBold}{i}.{ansiReset} {tName}")
+
+    try:
+        choice = int(input(f"\n{ansiBold}Seleccione el número de la tabla a consultar: {ansiReset}"))
+        if choice < 1 or choice > len(tableList):
+            print(f"{ansiRed}[ERROR]{ansiReset} Selección fuera de rango.")
+            input(f"\n{ansiBold}Presione Enter para continuar...{ansiReset}")
+            return
+
+        selectedTableName = tableList[choice - 1]
+
+        validColumns = [row[1].lower() for row in data["columnSizes"] if row[0] == selectedTableName]
+        print(f"Columnas válidas en la tabla '{selectedTableName}': {ansiMagenta}{', '.join(validColumns)}{ansiReset}")
+
+        columnNameInput = input(f"{ansiBold}Ingrese el nombre de la columna para la condición de igualdad: {ansiReset}").strip().lower()
+
+        if columnNameInput not in validColumns:
+            print(f"\n{ansiRed}[ERROR]{ansiReset} La columna '{columnNameInput}' no existe en la tabla '{selectedTableName}'.")
+            input(f"\n{ansiBold}Presione Enter para regresar...{ansiReset}")
+            return
+
+        indexedColumns = []
+        for row in data["indexDetails"]:
+            if row[0] == selectedTableName:
+                for c in row[3].split(","):
+                    indexedColumns.append(c.strip().lower())
+
+        hasIndex = columnNameInput in indexedColumns
+        rowNum = rowCountsMap.get(selectedTableName, 0)
+        recordSize = recordSizesMap.get(selectedTableName, 1)
+        fbt, _ = blockingFactorsMap.get(selectedTableName, (max(1, 8192 // recordSize), 682))
+        totalPages = max(1, -(-rowNum // fbt))
+
+        print(f"\n{ansiBlue}RESULTADOS DE AUDITORÍA FÍSICA DE ACCESO:{ansiReset}")
+
+        scanAccesses = totalPages
+        scanTimeMs = (scanAccesses * 8192) / (17 * 1024 * 1024) * 1000
+        print(f"\n{ansiBold}[BÚSQUEDA SECUENCIAL (TABLE SCAN)]{ansiReset}")
+        print(f"  - Costo de Entrada/Salida: {ansiRed}{scanAccesses}{ansiReset} páginas leídas de disco.")
+        print(f"  - Tiempo estimado de respuesta: {ansiRed}{scanTimeMs:.4f} ms{ansiReset}.")
+
+        print(f"\n{ansiBold}[BÚSQUEDA INDEXADA (INDEX ACCESS)]{ansiReset}")
+        if hasIndex:
+            idxAccesses = 3
+            idxTimeMs = (idxAccesses * 8192) / (17 * 1024 * 1024) * 1000
+            print(f"  - Se ha detectado un índoce, asumiendo yba estructura B+ Tree para {ansiMagenta}'{columnNameInput}'{ansiReset}.")
+            print(f"  - Costo de Entrada/Salida optimizado: {ansiGreen}{idxAccesses}{ansiReset} páginas leídas de disco.")
+            print(f"  - Tiempo estimado de respuesta optimizado: {ansiGreen}{idxTimeMs:.4f} ms{ansiReset}.")
+        else:
+            print(f"  - No se detectaron índices para la columna {ansiMagenta}'{columnNameInput}'{ansiReset} en el Diccionario de Datos.")
+            print("  - El motor se ve obligado a degradar la consulta a un escaneo secuencial físico.")
+            print(f"  - Costo de Entrada/Salida: {ansiRed}{scanAccesses}{ansiReset} páginas leídas.")
+            print(f"  - Tiempo estimado de respuesta: {ansiRed}{scanTimeMs:.4f} ms{ansiReset}.")
+
+    except Exception as e:
+        print(f"{ansiRed}[ERROR]{ansiReset} Entrada inválida durante el procesamiento: {e}")
+
+    input(f"\n{ansiBold}Presione Enter para regresar al menú principal...{ansiReset}")
+
+
 if __name__ == "__main__":
-    print("Initiating connection to the SQL Server Data Dictionary...")
+    clearScreen()
+
     try:
         databaseData = getDictionaryData()
-        print(f"Successfully connected to the database «{databaseData['dbName']}».")
-        print("Generating optimized PDF report...")
-        generatePdfReport(databaseData)
-        print("\033[1;32m[SUCCESS]\033[0m The technical report 'report.pdf' has been successfully generated.")
     except Exception as e:
-        print("\n\033[1;31m[CRITICAL ERROR]\033[0m Initialization failed:")
-        print(f"Detail: {e}")
+        print(f"\n{ansiRed}[ERROR CRÍTICO]{ansiReset} No se pudo conectar al repositorio.")
+        print(f"Detalle del error: {e}")
+        exit(1)
+
+    while True:
+        clearScreen()
+        print(f"\n{ansiBlue}╒════════════════════════════════════════════════════════╕{ansiReset}")
+        print(f"{ansiBlue}│      {ansiReset}STREAMUCV — INTERFAZ ADMINISTRATIVA DE DATOS{ansiBlue}      │{ansiReset}")
+        print(f"{ansiBlue}╘════════════════════════════════════════════════════════╛{ansiReset}\n")
+        print(" 1. Generar reporte formal de diagnóstico de almacenamiento")
+        print(" 2. Simular costos de Entrada/Salida en consultas de igualdad")
+        print(" 3. Salir del sistema\n")
+
+        userChoice = input(f"{ansiBold}Ingrese una opción (1-3): {ansiReset}").strip()
+
+        if userChoice == "1":
+            try:
+                generatePdfReport(databaseData)
+                print(f"{ansiGreen}[ÉXITO]{ansiReset} El archivo 'report.pdf' se ha generado correctamente.")
+            except Exception as e:
+                print(f"{ansiRed}[ERROR] Error al maquetar el documento: {e}{ansiReset}")
+            input(f"\n{ansiBold}Presione Enter para continuar...{ansiReset}")
+
+        elif userChoice == "2":
+            runCostSimulationMenu(databaseData)
+
+        elif userChoice == "3":
+            clearScreen()
+            print("Cerrando sesión administrativa de StreamUCV...")
+            break
