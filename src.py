@@ -11,7 +11,6 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.pdfgen import canvas
 
 ansiBlue = "\033[1;34m"
-ansiCyan = "\033[1;36m"
 ansiGreen = "\033[1;32m"
 ansiYellow = "\033[1;33m"
 ansiRed = "\033[1;31m"
@@ -68,11 +67,11 @@ def getRestrictionType(restrictionTypeString):
 
 
 def getTriggerType(triggerTypeString):
-    mapping = {
-        "SQL_TRIGGER": "Disparador T-SQL",
-        "CLR_TRIGGER": "Disparador CLR"
-    }
-    return mapping.get(triggerTypeString, "Otro")
+    if not triggerTypeString:
+        return "Otro"
+    val = triggerTypeString.replace("INSERT", "Inserción").replace("UPDATE", "Actualización").replace("DELETE", "Eliminación")
+    val = val.replace("AFTER", "AFTER (Después)").replace("INSTEAD OF", "INSTEAD OF (En lugar de)")
+    return val
 
 
 def getDictionaryData():
@@ -110,16 +109,6 @@ def getDictionaryData():
         cursor.execute("""
             SELECT 
                 t.name AS Nombre_Tabla, 
-                CASE WHEN i.name IS NULL THEN 'HEAP' ELSE i.name END AS Nombre_Indice 
-            FROM sys.tables t 
-            JOIN sys.indexes i ON t.object_id = i.object_id
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
-        """)
-        data["tableIndexesList"] = cursor.fetchall()
-
-        cursor.execute("""
-            SELECT 
-                t.name AS Nombre_Tabla, 
                 i.name AS Nombre_Indice, 
                 i.type_desc AS Tipo_Indice, 
                 STRING_AGG(c.name, ', ') AS Columnas, 
@@ -135,12 +124,13 @@ def getDictionaryData():
 
         cursor.execute("""
             SELECT 
-                o.name AS Nombre_Restriccion, 
                 t.name AS Tabla_Asociada, 
+                o.name AS Nombre_Restriccion, 
                 o.type_desc AS Tipo_Restriccion 
             FROM sys.objects o 
             JOIN sys.tables t ON o.parent_object_id = t.object_id
             WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+              AND o.type_desc LIKE '%_CONSTRAINT'
         """)
         data["constraints"] = cursor.fetchall()
 
@@ -151,7 +141,10 @@ def getDictionaryData():
                 CASE WHEN tr.is_disabled = 1 THEN 'INACTIVO' ELSE 'ACTIVO' END AS Estado, 
                 tr.create_date AS Fecha_Creacion, 
                 tr.modify_date AS Fecha_Modificacion,
-                tr.type_desc AS Tipo_Trigger
+                (CASE WHEN tr.is_instead_of_trigger = 1 THEN 'INSTEAD OF ' ELSE 'AFTER ' END + 
+                 (SELECT STRING_AGG(te.type_desc, ', ') 
+                  FROM sys.trigger_events te 
+                  WHERE te.object_id = tr.object_id)) AS Tipo_Trigger
             FROM sys.triggers tr 
             LEFT JOIN sys.tables t ON tr.parent_id = t.object_id
             WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
@@ -208,27 +201,39 @@ def getDictionaryData():
                 SELECT object_id, SUM(max_length) AS Tamano_Registro_Bytes
                 FROM sys.columns
                 GROUP BY object_id
-            ),
-            ColumnaClave AS (
-                SELECT
-                i.object_id,
-                SUM(c.max_length) AS Tamano_Clave_Bytes
-                FROM sys.indexes i
-                JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-                JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-                WHERE i.is_primary_key = 1
-                GROUP BY i.object_id
             )
             SELECT
             t.name AS Tabla,
             (8192/sc.Tamano_Registro_Bytes) AS Factor_Bloqueo_Tabla,
-            (8192/(8+ COALESCE(cc.Tamano_Clave_Bytes, 4))) AS Factor_Bloqueo_Indice
+            682 AS Factor_Bloqueo_Indice
             FROM sys.tables t
             JOIN SumaColumnas sc ON t.object_id = sc.object_id
-            LEFT JOIN ColumnaClave cc ON t.object_id = cc.object_id
             WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
         """)
         data["blockingFactors"] = cursor.fetchall()
+
+        cursor.execute("""
+            WITH ColumnaClave AS (
+                SELECT
+                    i.object_id,
+                    i.index_id,
+                    SUM(c.max_length) AS Tamano_Clave_Bytes
+                FROM sys.indexes i
+                JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                GROUP BY i.object_id, i.index_id
+            )
+            SELECT
+                t.name AS Tabla,
+                i.name AS Nombre_Indice,
+                COALESCE(cc.Tamano_Clave_Bytes, 4) AS Tamano_Clave_Bytes,
+                (8192 / (8 + COALESCE(cc.Tamano_Clave_Bytes, 4))) AS Factor_Bloqueo_Indice
+            FROM sys.tables t
+            JOIN sys.indexes i ON t.object_id = i.object_id
+            LEFT JOIN ColumnaClave cc ON i.object_id = cc.object_id AND i.index_id = cc.index_id
+            WHERE SCHEMA_NAME(t.schema_id) = 'streaming' AND i.type_desc <> 'HEAP'
+        """)
+        data["indexBlockingFactors"] = cursor.fetchall()
 
         cursor.execute("""
             SELECT 
@@ -415,7 +420,7 @@ def generatePdfReport(data, outputFilename="report.pdf"):
     restrRows = [ [Paragraph(h, styleHeaderCell) for h in restrHeaders] ]
 
     for row in data["constraints"]:
-        restName, associatedTable, restType = row
+        associatedTable, restName, restType = row
         restrRows.append([
             Paragraph(associatedTable, styleCellBold),
             Paragraph(restName, styleCell),
@@ -513,27 +518,26 @@ def generatePdfReport(data, outputFilename="report.pdf"):
     )
     sec5Flowables.append(Paragraph(explanationBlock, styleBody))
 
-    storageHeaders = ["Tabla", "Tamaño Tabla (Bytes)", "Tamaño Tabla (KB)", "Reg. Size (Bytes)", "Fbt", "Fbi"]
+    storageHeaders = ["Tabla", "Tamaño Tabla (Bytes)", "Tamaño Tabla (KB)", "Reg. Size (Bytes)", "Fbt"]
     storageRows = [ [Paragraph(h, styleHeaderCell) for h in storageHeaders] ]
 
-    blockingFactorsMap = {b[0]: (b[1], b[2]) for b in data["blockingFactors"]}
+    blockingFactorsMap = {b[0]: b[1] for b in data["blockingFactors"]}
     recordSizesMap = {r[0]: r[1] for r in data["recordSizes"]}
 
     for row in data["tableSizes"]:
         tName, sizeBytes, sizeKb = row
         recordSize = recordSizesMap.get(tName, 1)
-        fbt, fbi = blockingFactorsMap.get(tName, (1, 682))
+        fbt = blockingFactorsMap.get(tName, 1)
 
         storageRows.append([
             Paragraph(tName, styleCellBold),
             Paragraph(str(sizeBytes), styleCell),
             Paragraph(str(sizeKb) + " KB", styleCell),
             Paragraph(str(recordSize), styleCell),
-            Paragraph(str(fbt), styleCell),
-            Paragraph(str(fbi), styleCell)
+            Paragraph(str(fbt), styleCell)
         ])
 
-    tableStorage = Table(storageRows, colWidths=[114, 100, 100, 70, 60, 60])
+    tableStorage = Table(storageRows, colWidths=[134, 100, 100, 100, 70])
     tableStorage.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
         ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F8FAFC')]),
@@ -541,7 +545,33 @@ def generatePdfReport(data, outputFilename="report.pdf"):
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ('PADDING', (0,0), (-1,-1), 5),
     ]))
+
+    indexStorageHeaders = ["Tabla", "Nombre del Índice", "Ancho Clave (Bytes)", "Fbi (Índice)"]
+    indexStorageRows = [ [Paragraph(h, styleHeaderCell) for h in indexStorageHeaders] ]
+
+    for row in data["indexBlockingFactors"]:
+        tName, idxName, keySize, fbi = row
+        indexStorageRows.append([
+            Paragraph(tName, styleCellBold),
+            Paragraph(idxName, styleCell),
+            Paragraph(str(keySize), styleCell),
+            Paragraph(str(fbi), styleCell)
+        ])
+
+    tableIndexStorage = Table(indexStorageRows, colWidths=[124, 180, 100, 100])
+    tableIndexStorage.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F8FAFC')]),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('PADDING', (0,0), (-1,-1), 5),
+    ]))
+
+    sec5Flowables.append(Paragraph("<b>Capacidad de Almacenamiento de las Tablas:</b>", styleBody))
     sec5Flowables.append(tableStorage)
+    sec5Flowables.append(Spacer(1, 15))
+    sec5Flowables.append(Paragraph("<b>Factores de Bloqueo por Índice Individual:</b>", styleBody))
+    sec5Flowables.append(tableIndexStorage)
     flowables.append(KeepTogether(sec5Flowables))
     flowables.append(Spacer(1, 20))
 
@@ -582,7 +612,7 @@ def generatePdfReport(data, outputFilename="report.pdf"):
         rowNum = rowCountsMap.get(tName, 0)
         hasIndex = indexCountsMap.get(tName, 0) > 0
 
-        fbt, _ = blockingFactorsMap.get(tName, (max(1, 8192 // recordSize), 682))
+        fbt = blockingFactorsMap.get(tName, max(1, 8192 // recordSize))
         totalPages = max(1, -(-rowNum // fbt))
 
         scanAccesses = totalPages
@@ -648,10 +678,10 @@ def runCostSimulationMenu(data):
         validColumns = [row[1].lower() for row in data["columnSizes"] if row[0] == selectedTableName]
         print(f"Columnas válidas en la tabla '{selectedTableName}': {ansiMagenta}{', '.join(validColumns)}{ansiReset}")
 
-        columnNameInput = input(f"{ansiBold}Ingrese el nombre de la columna para la condición de igualdad: {ansiReset}").strip().lower()
+        columnNameInput = input(f"{ansiBold}Ingrese la columna para la condición de igualdad: {ansiReset}").strip().lower()
 
         if columnNameInput not in validColumns:
-            print(f"\n{ansiRed}[ERROR]{ansiReset} La columna '{columnNameInput}' no existe en la tabla '{selectedTableName}'.")
+            print(f"\n{ansiRed}[ERROR]{ansiReset} La columna '{columnNameInput}' no existe en la tabla «{selectedTableName}».")
             input(f"\n{ansiBold}Presione Enter para regresar...{ansiReset}")
             return
 
@@ -717,6 +747,7 @@ if __name__ == "__main__":
 
         if userChoice == "1":
             try:
+                databaseData = getDictionaryData()
                 generatePdfReport(databaseData)
                 print(f"{ansiGreen}[ÉXITO]{ansiReset} El archivo 'report.pdf' se ha generado correctamente.")
             except Exception as e:
@@ -724,7 +755,11 @@ if __name__ == "__main__":
             input(f"\n{ansiBold}Presione Enter para continuar...{ansiReset}")
 
         elif userChoice == "2":
-            runCostSimulationMenu(databaseData)
+            try:
+                databaseData = getDictionaryData()
+                runCostSimulationMenu(databaseData)
+            except Exception as e:
+                print(f"{ansiRed}[ERROR] Error al sincronizar metadatos: {e}{ansiReset}")
 
         elif userChoice == "3":
             clearScreen()
