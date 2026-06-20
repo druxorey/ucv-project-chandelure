@@ -77,9 +77,13 @@ def getTriggerType(triggerTypeString):
 def getDictionaryData():
     load_dotenv()
     sqlConnectionString = getenv("SQL_CONNECTION_STRING")
+    schemaName = getenv("SCHEMA_NAME")
 
     if not sqlConnectionString:
         raise ValueError("The SQL_CONNECTION_STRING variable is not defined in the .env file")
+
+    if not schemaName:
+        raise ValueError("The SCHEMA_NAME variable is not defined in the .env file")
 
     data = {}
     connection = None
@@ -91,22 +95,23 @@ def getDictionaryData():
 
         cursor.execute("SELECT DB_NAME() AS DatabaseName")
         data["dbName"] = cursor.fetchone()[0]
+        data["schemaName"] = schemaName
 
-        cursor.execute("SELECT COUNT(*) AS Cantidad_Tablas FROM sys.tables WHERE SCHEMA_NAME(schema_id) = 'streaming'")
+        cursor.execute(f"SELECT COUNT(*) AS Cantidad_Tablas FROM sys.tables WHERE SCHEMA_NAME(schema_id) = '{schemaName}'")
         data["totalTables"] = cursor.fetchone()[0]
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT 
                 t.name AS Nombre_Tabla, 
                 COUNT(i.name) AS Cantidad_Indices 
             FROM sys.tables t 
             LEFT JOIN sys.indexes i ON t.object_id = i.object_id 
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
             GROUP BY t.name
         """)
         data["indexSummary"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT 
                 t.name AS Nombre_Tabla, 
                 i.name AS Nombre_Indice, 
@@ -117,24 +122,24 @@ def getDictionaryData():
             JOIN sys.indexes i ON t.object_id = i.object_id 
             JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id 
             JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id 
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
             GROUP BY t.name, i.name, i.type_desc, i.is_unique
         """)
         data["indexDetails"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT 
                 t.name AS Tabla_Asociada, 
                 o.name AS Nombre_Restriccion, 
                 o.type_desc AS Tipo_Restriccion 
             FROM sys.objects o 
             JOIN sys.tables t ON o.parent_object_id = t.object_id
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
               AND o.type_desc LIKE '%_CONSTRAINT'
         """)
         data["constraints"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT 
                 tr.name AS Nombre_Trigger, 
                 t.name AS Tabla_Asociada, 
@@ -147,11 +152,11 @@ def getDictionaryData():
                   WHERE te.object_id = tr.object_id)) AS Tipo_Trigger
             FROM sys.triggers tr 
             LEFT JOIN sys.tables t ON tr.parent_id = t.object_id
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
         """)
         data["triggers"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             WITH SumaColumnas AS (
                 SELECT object_id, SUM(max_length) AS Tamano_Registro_Bytes
                 FROM sys.columns
@@ -168,22 +173,22 @@ def getDictionaryData():
             FROM sys.tables t
             JOIN SumaColumnas sc ON t.object_id = sc.object_id
             JOIN ConteoRegistros cr ON t.object_id = cr.object_id
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
         """)
         data["tableSizes"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT 
                 t.name AS Tabla, 
                 SUM(c.max_length) AS Tamano_Registro_Bytes 
             FROM sys.tables t 
             JOIN sys.columns c ON t.object_id = c.object_id 
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
             GROUP BY t.name;
         """)
         data["recordSizes"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT 
                 t.name AS Tabla, 
                 c.name AS Columna, 
@@ -192,11 +197,11 @@ def getDictionaryData():
             FROM sys.columns c 
             JOIN sys.tables t ON c.object_id = t.object_id 
             JOIN sys.types ty ON c.user_type_id=ty.user_type_id
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
         """)
         data["columnSizes"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             WITH SumaColumnas AS (
                 SELECT object_id, SUM(max_length) AS Tamano_Registro_Bytes
                 FROM sys.columns
@@ -208,11 +213,11 @@ def getDictionaryData():
             682 AS Factor_Bloqueo_Indice
             FROM sys.tables t
             JOIN SumaColumnas sc ON t.object_id = sc.object_id
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
         """)
         data["blockingFactors"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             WITH ColumnaClave AS (
                 SELECT
                     i.object_id,
@@ -231,17 +236,17 @@ def getDictionaryData():
             FROM sys.tables t
             JOIN sys.indexes i ON t.object_id = i.object_id
             LEFT JOIN ColumnaClave cc ON i.object_id = cc.object_id AND i.index_id = cc.index_id
-            WHERE SCHEMA_NAME(t.schema_id) = 'streaming' AND i.type_desc <> 'HEAP'
+            WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}' AND i.type_desc <> 'HEAP'
         """)
         data["indexBlockingFactors"] = cursor.fetchall()
 
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT 
                 t.name AS Tabla, 
                 SUM(p.rows) AS Cantidad_Registros 
             FROM sys.tables t 
             JOIN sys.partitions p ON t.object_id = p.object_id 
-            WHERE p.index_id <= 1 AND SCHEMA_NAME(t.schema_id) = 'streaming'
+            WHERE p.index_id <= 1 AND SCHEMA_NAME(t.schema_id) = '{schemaName}'
             GROUP BY t.name;
         """)
         data["rowCounts"] = cursor.fetchall()
@@ -340,7 +345,7 @@ def generatePdfReport(data, outputFilename="report.pdf"):
 
     metadataData = [
         [Paragraph("Base de Datos Analizada:", styleCellBold), Paragraph(data['dbName'], styleCell)],
-        [Paragraph("Esquema de Trabajo:", styleCellBold), Paragraph("'streaming'", styleCell)],
+        [Paragraph("Esquema de Trabajo:", styleCellBold), Paragraph(data['schemaName'], styleCell)],
         [Paragraph("Fecha del Diagnóstico:", styleCellBold), Paragraph(datetime.now().strftime("%d/%m/%Y — %H:%M"), styleCell)],
         [Paragraph("Total de Tablas Detectadas:", styleCellBold), Paragraph(str(data['totalTables']), styleCell)]
     ]
@@ -360,7 +365,7 @@ def generatePdfReport(data, outputFilename="report.pdf"):
     totalIndexes = sum(row[1] for row in data["indexSummary"])
     sec1Intro = (
         f"La base de datos analizada contiene una <b>cantidad total de {data['totalTables']} tablas</b> estructuradas "
-        f"dentro del esquema de trabajo 'streaming'. Se ha detectado una <b>cantidad total de {totalIndexes} índices</b> "
+        f"dentro del esquema de trabajo '{data['schemaName']}'. Se ha detectado una <b>cantidad total de {totalIndexes} índices</b> "
         f"configurados a lo largo de estas tablas. A continuación, se detalla la cantidad de índices "
         f"definidos individualmente para cada una de las tablas, junto con su composición física."
     )
@@ -656,7 +661,7 @@ def runCostSimulationMenu(data):
     print(f"\n{ansiBlue}╒════════════════════════════════════════════════════════╕{ansiReset}")
     print(f"{ansiBlue}│            {ansiReset}SIMULACIÓN INTERACTIVA DE COSTOS{ansiBlue}            │{ansiReset}")
     print(f"{ansiBlue}╘════════════════════════════════════════════════════════╛{ansiReset}\n")
-    print("Tablas disponibles en el esquema 'streaming':")
+    print(f"Tablas disponibles en el esquema '{data['schemaName']}':")
 
     rowCountsMap = {r[0]: r[1] for r in data["rowCounts"]}
     blockingFactorsMap = {b[0]: (b[1], b[2]) for b in data["blockingFactors"]}
@@ -709,7 +714,7 @@ def runCostSimulationMenu(data):
         if hasIndex:
             idxAccesses = 3
             idxTimeMs = (idxAccesses * 8192) / (17 * 1024 * 1024) * 1000
-            print(f"  - Se ha detectado un índoce, asumiendo yba estructura B+ Tree para {ansiMagenta}'{columnNameInput}'{ansiReset}.")
+            print(f"  - Se ha detectado un índice, asumiendo la estructura B+ Tree para {ansiMagenta}'{columnNameInput}'{ansiReset}.")
             print(f"  - Costo de Entrada/Salida optimizado: {ansiGreen}{idxAccesses}{ansiReset} páginas leídas de disco.")
             print(f"  - Tiempo estimado de respuesta optimizado: {ansiGreen}{idxTimeMs:.4f} ms{ansiReset}.")
         else:
