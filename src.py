@@ -209,7 +209,7 @@ def getDictionaryData():
             )
             SELECT
             t.name AS Tabla,
-            (8192/sc.Tamano_Registro_Bytes) AS Factor_Bloqueo_Tabla,
+            FLOOR(8192/sc.Tamano_Registro_Bytes) AS Factor_Bloqueo_Tabla,
             682 AS Factor_Bloqueo_Indice
             FROM sys.tables t
             JOIN SumaColumnas sc ON t.object_id = sc.object_id
