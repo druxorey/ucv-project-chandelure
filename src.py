@@ -209,8 +209,7 @@ def getDictionaryData():
             )
             SELECT
             t.name AS Tabla,
-            FLOOR(8192/sc.Tamano_Registro_Bytes) AS Factor_Bloqueo_Tabla,
-            682 AS Factor_Bloqueo_Indice
+            FLOOR(8192/sc.Tamano_Registro_Bytes) AS Factor_Bloqueo_Tabla
             FROM sys.tables t
             JOIN SumaColumnas sc ON t.object_id = sc.object_id
             WHERE SCHEMA_NAME(t.schema_id) = '{schemaName}'
@@ -232,7 +231,7 @@ def getDictionaryData():
                 t.name AS Tabla,
                 i.name AS Nombre_Indice,
                 COALESCE(cc.Tamano_Clave_Bytes, 4) AS Tamano_Clave_Bytes,
-                (8192 / (8 + COALESCE(cc.Tamano_Clave_Bytes, 4))) AS Factor_Bloqueo_Indice
+                FLOOR(8192 / (8 + COALESCE(cc.Tamano_Clave_Bytes, 4))) AS Factor_Bloqueo_Indice
             FROM sys.tables t
             JOIN sys.indexes i ON t.object_id = i.object_id
             LEFT JOIN ColumnaClave cc ON i.object_id = cc.object_id AND i.index_id = cc.index_id
